@@ -24,9 +24,18 @@ jobs:
         run: |
           pip install pyinstaller
           pyinstaller --onefile --name chatirc chatirc.py
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - name: Create GitHub Release
+        id: create_release
+        uses: softprops/turnstyle@v1
         with:
-          name: chatirc-${{ matrix.os }}
-          path: dist/
+          command: echo
+      - name: Upload to GitHub Release
+        if: startsWith(github.event.release.tag_name, 'v')
+        uses: softprops/action-gh-release@v1
+        with:
+          name: ${{ github.event.release.name }}
+          tag_name: ${{ github.event.release.tag_name }}
+          files: dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 *** End Patch

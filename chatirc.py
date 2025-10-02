@@ -220,6 +220,19 @@ class ChatIRC:
         self._api_inflight = False
         self._spinner_pos = 0
         self._spinner_states = ['|', '/', '-', '\\']
+        # theme -> color pair mapping (pair numbers are assigned in _init_curses_colors)
+        # this is a fallback/default mapping used before curses initializes
+        self.theme_color_map = {
+            'user': 1,
+            'assistant': 2,
+            'sys': 3,
+            'ascii1': 3,
+            'ascii2': 2,
+            'ascii3': 1,
+            'spinner': 2,
+            'indicator': 4,
+            'default': 3,
+        }
 
     def _ensure_room(self, name: str) -> Room:
         if name in self.rooms:
@@ -358,30 +371,59 @@ class ChatIRC:
         curses.start_color()
         curses.use_default_colors()
         try:
+            # assign sensible color pairs per theme and update the role->pair mapping
             if self.theme == "classic":
-                curses.init_pair(1, curses.COLOR_RED, -1)
-                curses.init_pair(2, curses.COLOR_GREEN, -1)
-                curses.init_pair(3, curses.COLOR_BLUE, -1)
+                curses.init_pair(1, curses.COLOR_BLUE, -1)   # user
+                curses.init_pair(2, curses.COLOR_GREEN, -1)  # assistant
+                curses.init_pair(3, curses.COLOR_YELLOW, -1) # sys/default
+                self.theme_color_map.update({
+                    'user': 1, 'assistant': 2, 'sys': 3,
+                    'ascii1': 3, 'ascii2': 2, 'ascii3': 1,
+                    'spinner': 2, 'indicator': 3, 'default': 3,
+                })
             elif self.theme == "neon":
                 curses.init_pair(1, curses.COLOR_MAGENTA, -1)
                 curses.init_pair(2, curses.COLOR_CYAN, -1)
                 curses.init_pair(3, curses.COLOR_YELLOW, -1)
+                self.theme_color_map.update({
+                    'user': 1, 'assistant': 2, 'sys': 3,
+                    'ascii1': 1, 'ascii2': 2, 'ascii3': 3,
+                    'spinner': 1, 'indicator': 2, 'default': 3,
+                })
             elif self.theme == "mono":
                 curses.init_pair(1, curses.COLOR_WHITE, -1)
                 curses.init_pair(2, curses.COLOR_WHITE, -1)
                 curses.init_pair(3, curses.COLOR_WHITE, -1)
+                self.theme_color_map.update({
+                    'user': 1, 'assistant': 2, 'sys': 3,
+                    'ascii1': 1, 'ascii2': 1, 'ascii3': 1,
+                    'spinner': 1, 'indicator': 1, 'default': 1,
+                })
             elif self.theme == "glow":
-                curses.init_pair(1, curses.COLOR_BLUE, -1)
-                curses.init_pair(2, curses.COLOR_YELLOW, -1)
-                curses.init_pair(3, curses.COLOR_CYAN, -1)
+                # Glow theme: user = blue, assistant ~= orange (use yellow), sys = cyan
+                curses.init_pair(1, curses.COLOR_BLUE, -1)    # user
+                curses.init_pair(2, curses.COLOR_YELLOW, -1)  # assistant (warm/orange approximation)
+                curses.init_pair(3, curses.COLOR_CYAN, -1)    # sys/default
+                # a highlighted spinner/indicator pair with a colored background if supported
                 try:
-                    curses.init_pair(4, curses.COLOR_YELLOW, curses.COLOR_BLUE)
+                    curses.init_pair(4, curses.COLOR_RED, curses.COLOR_BLUE)
                 except Exception:
-                    curses.init_pair(4, curses.COLOR_YELLOW, -1)
+                    # fallback to a visible red foreground
+                    curses.init_pair(4, curses.COLOR_RED, -1)
+                self.theme_color_map.update({
+                    'user': 1, 'assistant': 2, 'sys': 3,
+                    'ascii1': 1, 'ascii2': 2, 'ascii3': 3,
+                    'spinner': 4, 'indicator': 4, 'default': 3,
+                })
             else:
-                curses.init_pair(1, curses.COLOR_RED, -1)
+                curses.init_pair(1, curses.COLOR_BLUE, -1)
                 curses.init_pair(2, curses.COLOR_GREEN, -1)
-                curses.init_pair(3, curses.COLOR_BLUE, -1)
+                curses.init_pair(3, curses.COLOR_YELLOW, -1)
+                self.theme_color_map.update({
+                    'user': 1, 'assistant': 2, 'sys': 3,
+                    'ascii1': 3, 'ascii2': 2, 'ascii3': 1,
+                    'spinner': 2, 'indicator': 3, 'default': 3,
+                })
         except Exception:
             # If terminal doesn't support colors, ignore failures
             pass
@@ -462,6 +504,8 @@ class ChatIRC:
 
             curses.curs_set(1)
             stdscr.keypad(True)
+            # Poll getch periodically so background API replies are processed
+            stdscr.timeout(120)
 
             resize_pending = False
             def resize_handler(sig, frame):
@@ -511,13 +555,24 @@ class ChatIRC:
                     chat_lines = self.current_room.chat_log[-(chat_h):]
                     display_items = []
                     for line in chat_lines:
-                        if line.startswith("[ASCII]"):
-                            display_items.append((True, line[len("[ASCII]"):]))
+                        role = None
+                        body = line
+                        if isinstance(line, str) and line.startswith("[ROLE:"):
+                            # format: [ROLE:role]rest_of_line
+                            try:
+                                end = line.index(']')
+                                role = line[6:end]
+                                body = line[end+1:]
+                            except Exception:
+                                role = None
+                                body = line
+                        if isinstance(body, str) and body.startswith("[ASCII]"):
+                            display_items.append((True, body[len("[ASCII]"):], role))
                         else:
-                            wrapped = self._wrap_text_for_display(line, chat_width)
+                            wrapped = self._wrap_text_for_display(body, chat_width)
                             for chunk in wrapped:
-                                display_items.append((False, chunk))
-                    for i, (is_ascii, text) in enumerate(display_items[-(chat_h):]):
+                                display_items.append((False, chunk, role))
+                    for i, (is_ascii, text, role) in enumerate(display_items[-(chat_h):]):
                         if i >= chat_h:
                             break
                         row = i
@@ -550,12 +605,19 @@ class ChatIRC:
                                     pass
                                 acc += (wch if wch and wch > 0 else 1)
                         else:
-                            if '[*]' in text:
-                                chat_win.attron(curses.color_pair(1))
-                            elif '[Chat]' in text:
-                                chat_win.attron(curses.color_pair(2))
-                            else:
-                                chat_win.attron(curses.color_pair(3))
+                            # choose color pair based on role mapping
+                            try:
+                                if role == 'user':
+                                    cp = 1
+                                elif role in ('bot', 'assistant'):
+                                    cp = 2
+                                elif role == 'sys':
+                                    cp = 3
+                                else:
+                                    cp = 3
+                                chat_win.attron(curses.color_pair(cp))
+                            except Exception:
+                                pass
                             # slice by display width
                             sliced = _slice_to_display_width(text, chat_width)
                             try:
@@ -738,18 +800,25 @@ class ChatIRC:
 
                 stdscr.refresh()
 
-                # Process any completed API results from background thread
+                # Process any completed API results from background thread so replies appear immediately
+                api_updated = False
                 try:
                     while not self._api_queue.empty():
                         user_input, success, payload = self._api_queue.get_nowait()
                         if success:
                             reply = payload
-                            # append assistant message and chat
-                            self.current_room.append_message("assistant", reply)
-                            self.add_to_chat(reply, 2, "Chat")
+                            # append assistant message and chat (role-marked)
+                            ts = datetime.now().strftime('%H:%M')
+                            self.current_room.chat_log.append(f"[ROLE:assistant][{ts}] Chat> {reply}")
                         else:
                             err = self.parse_error(str(payload))
-                            self.add_to_chat(f"Error: {err}", 1, "*")
+                            ts = datetime.now().strftime('%H:%M')
+                            self.current_room.chat_log.append(f"[ROLE:sys][{ts}] * Error: {err}")
+                        api_updated = True
+                    if api_updated:
+                        # redraw immediately
+                        draw_screen(h, w)
+                        stdscr.refresh()
                 except Exception:
                     pass
 
@@ -790,7 +859,9 @@ class ChatIRC:
                     continue
                 if ch in (curses.KEY_ENTER, 10, 13):
                     user_input = input_buf.strip()
+                    # reset input buffer and cursor
                     input_buf = ''
+                    input_cursor = 0
                     if not user_input:
                         continue
                     if user_input.lower() in ["/quit", "/exit"]:
@@ -809,14 +880,18 @@ class ChatIRC:
                         except Exception:
                             pass
 
-                        # Post the user message immediately to chat and start an async API call
-                        self.current_room.append_message("user", user_input)
-                        self.add_to_chat(user_input, 3, self.nick)
+                        # Post the user message immediately to chat (role-marked) and start an async API call
+                        ts = datetime.now().strftime('%H:%M')
+                        self.current_room.chat_log.append(f"[ROLE:user][{ts}] {self.nick}> {user_input}")
+                        draw_screen(h, w)
+                        stdscr.refresh()
                         # start background API call
                         started = self.start_api_call(self.current_room.messages, user_input)
                         if not started:
-                            # if a call is already inflight, inform user
-                            self.add_to_chat("Another request is in progress. Please wait...", 1, "*")
+                            ts = datetime.now().strftime('%H:%M')
+                            self.current_room.chat_log.append(f"[ROLE:sys][{ts}] * Another request is in progress. Please wait...")
+                            draw_screen(h, w)
+                            stdscr.refresh()
                     continue
                 # Input editing: support cursor, backspace, delete, arrows
                 if ch in (curses.KEY_BACKSPACE, 127, 8):
