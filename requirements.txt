@@ -1,0 +1,6 @@
+openai
+# Optional test runner
+pytest
+
+# For accurate terminal column width handling (Unicode)
+wcwidth

@@ -1,0 +1,14 @@
+[tool.poetry]
+name = "chatirc"
+version = "0.1.0"
+description = "IRC-style CLI front-end for OpenAI chat models"
+authors = ["Your Name <you@example.com>"]
+
+[tool.poetry.dependencies]
+python = "^3.11 || ^3.12"
+openai = "*"
+wcwidth = "*"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"

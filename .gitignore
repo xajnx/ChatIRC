@@ -1,0 +1,29 @@
+openapi_key
+*.pyc
+__pycache__/
+dist/
+build/
+*.spec
+venv/
+.venv/
+/.pytest_cache
+.pytest_cache/
+.mypy_cache/
+/.idea
+.vscode
+*.egg-info
+chatlog-*.txt
+*.sqlite3
+# Ignore the real API key file
+openapi_key
+
+# Local chat history
+~/.chatirc_history
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Dev Scripts
+test_chatirc.py
+test_runner.py
