@@ -27,3 +27,6 @@ __pycache__/
 # Dev Scripts
 test_chatirc.py
 test_runner.py
+
+# Local non-essential files and notes (contains credentials/workflow notes)
+ignore/
