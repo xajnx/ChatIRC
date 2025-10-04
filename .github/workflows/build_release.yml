@@ -4,8 +4,31 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+  push:
+    branches: [ release-prep ]
+  pull_request:
 
 jobs:
+  tests:
+    name: Run tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+      - name: Install test deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest
+          if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
+        shell: bash
+      - name: Run pytest
+        run: |
+          pytest -q
+        shell: bash
+
   build-and-upload:
     name: Build on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
@@ -35,6 +58,8 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install pyinstaller
+          # install jq for JSON parsing used in the upload step
+          if command -v apt-get >/dev/null 2>&1; then sudo apt-get update && sudo apt-get install -y jq || true; fi
           # install optional deps if present
           if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
         shell: bash
@@ -43,7 +68,59 @@ jobs:
         run: |
           # ensure a clean build
           rm -rf build dist
-          pyinstaller --noconfirm --onefile chatirc.py
+          ICON_SRC=assets/appicon.png
+          ICON_ARG=""
+          # Install ImageMagick/icon tooling as needed and generate platform-native icons where possible
+          if [ "${{ matrix.osname }}" = "linux" ]; then
+            sudo apt-get update
+            sudo apt-get install -y imagemagick || true
+            if command -v convert >/dev/null 2>&1; then
+              mkdir -p build/icon
+              convert "$ICON_SRC" -resize 256x256 build/icon/appicon.ico || true
+              if [ -f build/icon/appicon.ico ]; then
+                ICON_ARG="--icon=build/icon/appicon.ico"
+              fi
+            fi
+          elif [ "${{ matrix.osname }}" = "windows" ]; then
+            # Attempt to install ImageMagick via choco if convert not present
+            if ! command -v convert >/dev/null 2>&1; then
+              choco install imagemagick -y || true
+            fi
+            if command -v convert >/dev/null 2>&1; then
+              mkdir -p build/icon
+              convert "$ICON_SRC" -resize 256x256 build/icon/appicon.ico || true
+              if [ -f build/icon/appicon.ico ]; then
+                ICON_ARG="--icon=build/icon/appicon.ico"
+              fi
+            fi
+          elif [ "${{ matrix.osname }}" = "macos" ]; then
+            # macOS: use sips + iconutil to create an .icns
+            if ! command -v sips >/dev/null 2>&1; then
+              brew install imagemagick || true
+            fi
+            mkdir -p build/iconset
+            # create iconset variants
+            sips -z 16 16     "$ICON_SRC" --out build/iconset/icon_16x16.png || true
+            sips -z 32 32     "$ICON_SRC" --out build/iconset/icon_16x16@2x.png || true
+            sips -z 32 32     "$ICON_SRC" --out build/iconset/icon_32x32.png || true
+            sips -z 64 64     "$ICON_SRC" --out build/iconset/icon_32x32@2x.png || true
+            sips -z 128 128   "$ICON_SRC" --out build/iconset/icon_128x128.png || true
+            sips -z 256 256   "$ICON_SRC" --out build/iconset/icon_128x128@2x.png || true
+            sips -z 256 256   "$ICON_SRC" --out build/iconset/icon_256x256.png || true
+            sips -z 512 512   "$ICON_SRC" --out build/iconset/icon_256x256@2x.png || true
+            sips -z 512 512   "$ICON_SRC" --out build/iconset/icon_512x512.png || true
+            sips -z 1024 1024 "$ICON_SRC" --out build/iconset/icon_512x512@2x.png || true
+            if command -v iconutil >/dev/null 2>&1; then
+              mkdir -p build/icon
+              iconutil -c icns build/iconset -o build/icon/appicon.icns || true
+              if [ -f build/icon/appicon.icns ]; then
+                ICON_ARG="--icon=build/icon/appicon.icns"
+              fi
+            fi
+          fi
+
+          # bundle assets into the exe so the runtime can access the appicon and themes
+          pyinstaller --noconfirm --onefile $ICON_ARG --add-data "assets/appicon.png:assets" --add-data "assets/appicon.ico:assets" --add-data "assets/appicon.icns:assets" --add-data "assets/theme-classic.png:assets" --add-data "assets/theme-neon.png:assets" --add-data "assets/theme-glow.png:assets" --add-data "assets/theme-mono.png:assets" chatirc.py
         shell: bash
 
       - id: package
@@ -119,22 +196,43 @@ jobs:
           asset_content_type: text/plain
 
       - name: Upload artifact to Gumroad
-        if: github.event_name == 'release' && secrets.GUMROAD_TOKEN && secrets.GUMROAD_PRODUCT_ID
+        if: github.event_name == 'release'
         run: |
           set -euo pipefail
           ART=${{ steps.package.outputs.ART_PATH }}
           echo "Uploading $ART to Gumroad product $GUMROAD_PRODUCT_ID"
           # Gumroad file upload endpoint (v2): POST /products/:product_id/files
-          RESP=$(curl -s -w "%{http_code}" -o /tmp/gumresp.txt -F "access_token=$GUMROAD_TOKEN" -F "file=@${ART}" "https://api.gumroad.com/v2/products/${GUMROAD_PRODUCT_ID}/files")
-          CODE=$?
-          HTTP_CODE=$(tail -n1 /tmp/gumresp.txt || echo '')
-          echo "Gumroad response:"; cat /tmp/gumresp.txt
-          if [ $CODE -ne 0 ]; then
-            echo "Curl failed with exit $CODE"; exit 1
+          TMP=$(mktemp)
+          HTTP_CODE=$(curl -s -w "%{http_code}" -o "$TMP" -F "access_token=$GUMROAD_TOKEN" -F "file=@${ART}" "https://api.gumroad.com/v2/products/${GUMROAD_PRODUCT_ID}/files")
+          echo "Gumroad response:"; cat "$TMP"
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "Gumroad upload failed with HTTP $HTTP_CODE"; cat "$TMP"; exit 1
           fi
+          # verify JSON success field
+          if ! jq -e '.success == true' "$TMP" >/dev/null 2>&1; then
+            echo "Gumroad returned non-success response"; cat "$TMP"; exit 1
+          fi
+          # persist response for later inspection
+          mv "$TMP" "$GITHUB_WORKSPACE/gumroad-upload-response.json"
         env:
           GUMROAD_TOKEN: ${{ secrets.GUMROAD_TOKEN }}
           GUMROAD_PRODUCT_ID: ${{ secrets.GUMROAD_PRODUCT_ID }}
+        shell: bash
+
+      - name: Upload Gumroad response artifact
+        if: github.event_name == 'release' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gumroad-upload-response
+          path: gumroad-upload-response.json
+
+      - name: Notify Slack (optional)
+        if: github.event_name == 'release' && secrets.SLACK_WEBHOOK
+        run: |
+          PAYLOAD=$(jq -n --arg text "ChatIRC release $GITHUB_REF published: ${{ github.event.release.html_url }}" '{text: $text}')
+          curl -s -X POST -H 'Content-type: application/json' --data "$PAYLOAD" $SLACK_WEBHOOK
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
         shell: bash
 
       - name: Persist artifact for workflow_dispatch (upload to workflow run)

@@ -19,7 +19,7 @@ import importlib
 import importlib.util
 from importlib import metadata as importlib_metadata
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 import readline
 import atexit
 import time
@@ -27,6 +27,7 @@ import curses
 import signal
 import textwrap
 import webbrowser
+import sys
 
 # package version
 __version__ = "0.1.0"
@@ -37,6 +38,14 @@ try:
 except Exception:
     _wcswidth = None
     _wcwidth = None
+
+# Optional tiktoken for accurate token estimates
+_have_tiktoken = False
+try:
+    import tiktoken
+    _have_tiktoken = True
+except Exception:
+    _have_tiktoken = False
 
 
 def _display_width(s: str) -> int:
@@ -92,10 +101,138 @@ SLASH_COMMANDS = ["/quit", "/clear", "/save", "/load", "/topic", "/help", "/room
 # Defaults
 MAX_HISTORY = int(os.environ.get("CHATIRC_MAX_HISTORY", "20"))
 MODEL = os.environ.get("OPENAI_MODEL", "gpt-3.5-turbo")
+# Token budgeting: approximate tokens by dividing characters by this ratio
+MAX_TOKEN_BUDGET = int(os.environ.get("CHATIRC_MAX_TOKEN_BUDGET", "2000"))
+TOKEN_CHAR_RATIO = float(os.environ.get("CHATIRC_TOKEN_CHAR_RATIO", "4.0"))
+AVERAGE_QUERY_TOKENS = int(os.environ.get("CHATIRC_AVG_QUERY_TOKENS", "350"))
 
 
 def human_system(msg: str) -> str:
     return f"{TIME_COLOR}[{datetime.now().strftime('%H:%M')}] {SYS_COLOR}* {msg}{RESET}"
+
+
+def _estimate_tokens_from_messages(messages: List[Dict[str, str]]) -> int:
+    # Use tiktoken if available and messages include model info
+    # messages is a list of {'role':..., 'content':...}
+    try:
+        if _have_tiktoken:
+            # choose encoding for a default model (gpt-3.5-turbo style) if available
+            enc = None
+            try:
+                enc = tiktoken.encoding_for_model(str(os.environ.get('OPENAI_MODEL', MODEL)))
+            except Exception:
+                try:
+                    enc = tiktoken.get_encoding('cl100k_base')
+                except Exception:
+                    enc = None
+            total = 0
+            if enc:
+                for m in messages:
+                    total += len(enc.encode(str(m.get('content', ''))))
+                return max(1, total)
+    except Exception:
+        pass
+    # fallback: very rough estimate: total characters divided by TOKEN_CHAR_RATIO
+    total_chars = 0
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        total_chars += len(str(m.get('content', '')))
+    return max(1, int(total_chars / TOKEN_CHAR_RATIO))
+
+
+def _trim_messages_to_budget(messages: List[Dict[str, str]], budget_tokens: int, policy: str = 'oldest') -> Tuple[List[Dict[str, str]], bool]:
+    """Trim oldest non-system messages until estimated tokens <= budget_tokens.
+    Returns (new_messages, trimmed_flag). Always preserves any system messages at the start.
+    """
+    if not messages:
+        return messages, False
+    # keep system seeds at start
+    systems = [m for m in messages if m.get('role') == 'system']
+    others = [m for m in messages if m.get('role') != 'system']
+    trimmed = False
+    curr = systems + others
+    # parse policy
+    if policy and policy.startswith('keep_last:'):
+        try:
+            keep_n = int(policy.split(':', 1)[1])
+        except Exception:
+            keep_n = 0
+        # drop from oldest until only keep_n of others remain or token budget satisfied
+        while _estimate_tokens_from_messages(curr) > budget_tokens and len(others) > keep_n:
+            others.pop(0)
+            curr = systems + others
+            trimmed = True
+    else:
+        # default 'oldest' policy: drop oldest until within budget
+        while _estimate_tokens_from_messages(curr) > budget_tokens and others:
+            others.pop(0)
+            curr = systems + others
+            trimmed = True
+    return curr, trimmed
+
+
+def _normalize_trim_policy(policy: str) -> str:
+    """Validate and normalize a trim policy string.
+
+    Accepted policies:
+      - 'oldest' : drop oldest non-system messages until within budget
+      - 'keep_last:N' : keep only the last N non-system messages
+
+    Raises ValueError on invalid input. Returns the normalized policy string.
+    """
+    if not policy or not isinstance(policy, str):
+        raise ValueError("Empty or non-string trim policy")
+    p = policy.strip()
+    if p == 'oldest':
+        return 'oldest'
+    if p.startswith('keep_last:'):
+        try:
+            num = int(p.split(':', 1)[1])
+            if num < 0:
+                raise ValueError("keep_last count must be non-negative")
+            return f"keep_last:{num}"
+        except Exception:
+            raise ValueError("Invalid keep_last:N policy format")
+    raise ValueError(f"Unknown trim policy: {policy}")
+
+
+def get_asset_path(name: str) -> str:
+    """Return an absolute path to an asset stored in the `assets/` folder.
+
+    When running from a PyInstaller onefile bundle, the assets are extracted to
+    sys._MEIPASS; otherwise we return the relative path under the project.
+    """
+    # when running in a PyInstaller bundle
+    base = None
+    if getattr(sys, '_MEIPASS', None):
+        base = sys._MEIPASS
+    else:
+        # project layout: assets/ at repo root
+        base = os.path.abspath(os.path.dirname(__file__))
+    candidate = os.path.join(base, 'assets', name)
+    if os.path.exists(candidate):
+        return candidate
+    # fallback: try direct path under repo root
+    candidate2 = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'assets', name)
+    if os.path.exists(candidate2):
+        return candidate2
+    raise FileNotFoundError(name)
+
+
+def get_theme_image_paths() -> Dict[str, str]:
+    """Return a mapping of theme name -> asset path for shipped theme images.
+
+    Non-fatal: if an asset is missing the entry is omitted.
+    """
+    out: Dict[str, str] = {}
+    for nm in ('theme-classic.png', 'theme-neon.png', 'theme-glow.png', 'theme-mono.png'):
+        try:
+            out[nm] = get_asset_path(nm)
+        except Exception:
+            # skip missing
+            pass
+    return out
 
 
 class Room:
@@ -104,10 +241,14 @@ class Room:
         self.topic = "Welcome to #chatgpt — type /help for commands"
         self.chat_log: List[str] = []
         self.max_history = max_history
+        # per-room model (None means use global default MODEL)
+        self.model: Optional[str] = None
+        # trimming policy: 'oldest' (drop oldest) or 'keep_last:N' to keep last N messages
+        self.trim_policy: str = "oldest"
         self.messages: List[Dict[str, str]] = [
             {
                 "role": "system",
-                "content": "You are a helpful assistant speaking in short IRC-style lines. Keep replies concise and friendly.",
+                "content": "You are ChatIRC Navigator, nostalgic and friendly. Keep replies concise and in an IRC-style tone.",
             }
         ]
 
@@ -156,6 +297,10 @@ class ChatIRC:
         global MODEL
         MODEL = str(self.config.get("model", MODEL))
         self.nick = str(self.config.get("nick", "You"))
+        # rooms dict and current room
+        self.rooms: Dict[str, Room] = {}
+        # ensure a default room
+        self.current_room = self._ensure_room('main')
         self.theme = str(self.config.get("theme", "classic"))
         # how many input lines to show at most (can be tuned in ~/.chatircrc)
         try:
@@ -198,18 +343,14 @@ class ChatIRC:
             self.client = None
             self.api_style = "none"
 
-        # rooms
-        self.rooms: Dict[str, Room] = {}
-        self.current_room = self._ensure_room("main")
-        self.mode = "compact"
-        # input history for readline-like navigation
+        # Note: if tiktoken is available we used it earlier in _estimate_tokens_from_messages
+        # but here we keep the trimming logic independent and rely on that function for accurate counts.
+        # input history persistence
+        self.history_path = os.path.expanduser('~/.chatirchistory')
         self.input_history: List[str] = []
-        self._history_index: Optional[int] = None
-        # history file
-        self.history_path = os.path.expanduser("~/.chatirchistory")
         try:
             if os.path.exists(self.history_path):
-                with open(self.history_path, "r", encoding="utf-8") as hf:
+                with open(self.history_path, 'r', encoding='utf-8') as hf:
                     lines = [ln.rstrip('\n') for ln in hf.readlines() if ln.strip()]
                     self.input_history = lines[-200:]
         except Exception:
@@ -233,6 +374,13 @@ class ChatIRC:
             'indicator': 4,
             'default': 3,
         }
+        # transient UI notice: (message, expire_time)
+        self._transient_notice: Optional[tuple] = None
+        # discover bundled assets (when packaged with PyInstaller, assets are in sys._MEIPASS)
+        try:
+            self.app_icon_path = get_asset_path('appicon.png')
+        except Exception:
+            self.app_icon_path = None
 
     def _ensure_room(self, name: str) -> Room:
         if name in self.rooms:
@@ -264,6 +412,8 @@ class ChatIRC:
             "room": self.current_room.name,
             "topic": self.current_room.topic,
             "messages": self.current_room.messages,
+            "model": getattr(self.current_room, 'model', None),
+            "trim_policy": getattr(self.current_room, 'trim_policy', 'oldest'),
             "saved_at": datetime.now().isoformat(),
         }
         with open(filename, "w", encoding="utf-8") as f:
@@ -285,6 +435,13 @@ class ChatIRC:
                 meta = json.loads(lines[1])
                 r.topic = meta.get("topic", r.topic)
                 r.messages = meta.get("messages", r.messages)
+                # restore per-room model if present
+                r.model = meta.get("model", getattr(r, 'model', None))
+                try:
+                    r.trim_policy = _normalize_trim_policy(meta.get("trim_policy", getattr(r, 'trim_policy', 'oldest')))
+                except Exception:
+                    # keep existing default and log a warning into chat_log
+                    r.chat_log.append(f"[ROLE:sys] Invalid trim_policy in file; using default: {r.trim_policy}")
                 r.chat_log.extend(lines[3:])
                 return r
             except Exception:
@@ -305,7 +462,7 @@ class ChatIRC:
         print(line)
         self.current_room.append_print(line)
 
-    def run_api_call(self, payload_messages: List[Dict[str, str]]):
+    def run_api_call(self, payload_messages: List[Dict[str, str]], model: Optional[str] = None):
         # Keep a synchronous API call path for non-UI usage
         if not self.client:
             raise RuntimeError("OpenAI client not configured (missing API key or library)")
@@ -313,9 +470,11 @@ class ChatIRC:
         for attempt in range(3):
             try:
                 if self.api_style == "openai_new":
-                    resp = self.client.chat.completions.create(model=MODEL, messages=payload_messages)
+                    model_to_use = model if model else MODEL
+                    resp = self.client.chat.completions.create(model=model_to_use, messages=payload_messages)
                 elif self.api_style == "openai_legacy":
-                    resp = self.client.ChatCompletion.create(model=MODEL, messages=payload_messages)
+                    model_to_use = model if model else MODEL
+                    resp = self.client.ChatCompletion.create(model=model_to_use, messages=payload_messages)
                 else:
                     raise RuntimeError("No supported OpenAI client available")
                 return resp
@@ -326,7 +485,7 @@ class ChatIRC:
             raise last_exc
         raise RuntimeError("API call failed")
 
-    def _run_api_call_thread(self, payload_messages: List[Dict[str, str]], user_input: str):
+    def _run_api_call_thread(self, payload_messages: List[Dict[str, str]], user_input: str, model: Optional[str] = None):
         """Worker thread target: run the API call and put (user_input, success, payload) into queue."""
         try:
             # Optional debug: if env var set, publish a short snapshot of the payload to chat log
@@ -340,7 +499,7 @@ class ChatIRC:
                     self.current_room.chat_log.append(f"[ROLE:sys][{ts}] *DEBUG PAYLOAD: {payload_preview}")
             except Exception:
                 pass
-            resp = self.run_api_call(payload_messages)
+            resp = self.run_api_call(payload_messages, model=model)
             reply = self._extract_reply_from_response(resp)
             self._api_queue.put((user_input, True, reply))
         except Exception as e:
@@ -348,12 +507,12 @@ class ChatIRC:
         finally:
             self._api_inflight = False
 
-    def start_api_call(self, payload_messages: List[Dict[str, str]], user_input: str):
+    def start_api_call(self, payload_messages: List[Dict[str, str]], user_input: str, model: Optional[str] = None):
         """Start background API call if none in flight; returns True if started."""
         if self._api_inflight:
             return False
         self._api_inflight = True
-        t = threading.Thread(target=self._run_api_call_thread, args=(payload_messages, user_input), daemon=True)
+        t = threading.Thread(target=self._run_api_call_thread, args=(payload_messages, user_input, model), daemon=True)
         t.start()
         return True
 
@@ -518,6 +677,9 @@ class ChatIRC:
             # Poll getch periodically so background API replies are processed
             stdscr.timeout(120)
 
+            # how many columns to reserve at the right of the status line for the spinner/indicator
+            spinner_reserve = 3
+
             resize_pending = False
             def resize_handler(sig, frame):
                 nonlocal resize_pending
@@ -652,9 +814,86 @@ class ChatIRC:
                     stdscr.addstr(1+i, rooms_start, room[:rooms_width])
                     stdscr.attroff(curses.A_BOLD)
 
-                # Draw status
-                status = f"Room: {self.current_room.name} | Theme: {self.theme}"
-                stdscr.addstr(h-1, 1, status[:w-2])
+                # Draw status: include room, topic, theme, and estimated queries remaining
+                try:
+                    # estimate tokens used by current room messages
+                    est_used = _estimate_tokens_from_messages(self.current_room.messages)
+                    queries_left = max(0, (MAX_TOKEN_BUDGET - est_used) // AVERAGE_QUERY_TOKENS)
+                except Exception:
+                    queries_left = 0
+                topic_snip = (self.current_room.topic[:20] + '...') if len(self.current_room.topic) > 23 else self.current_room.topic
+                # Build left and right aligned status segments to avoid overlap and leftover chars
+                left = f"Room:{self.current_room.name} | {topic_snip}"
+                right = f"{self.theme} | q:{queries_left}"
+                # ensure segments fit
+                try:
+                    left_w = _display_width(left)
+                    right_w = _display_width(right)
+                except Exception:
+                    left_w = len(left)
+                    right_w = len(right)
+
+                # compute available space between left and right inside width w-2,
+                # but reserve some columns at the far right for the spinner so they never overlap
+                usable_width = max(0, (w - 2) - spinner_reserve)
+                avail = max(0, usable_width - (left_w + right_w))
+                # if no space, trim topic from the left side
+                if avail == 0:
+                    # reserve 1 char as separator if possible
+                    max_left = max(0, usable_width - (right_w + 1))
+                    # truncate left by display width aware slicing
+                    if max_left < left_w:
+                        # naive fallback to simple slice if wcwidth not available
+                        try:
+                            # reduce topic_snip length accordingly
+                            # left has format 'Room:<name> | <topic>' -> keep 'Room:<name> | '
+                            prefix = f"Room:{self.current_room.name} | "
+                            keep = max(0, max_left - _display_width(prefix))
+                            if keep <= 0:
+                                left = prefix.strip()[:max_left]
+                            else:
+                                left = prefix + _slice_to_display_width(topic_snip, keep)
+                        except Exception:
+                            left = left[:max_left]
+                    # recalc widths
+                    try:
+                        left_w = _display_width(left)
+                    except Exception:
+                        left_w = len(left)
+                    avail = max(0, usable_width - (left_w + right_w))
+
+                # build the composed status with spacing between left and right, limited to usable_width
+                spacer = ' ' * avail
+                composed = left + spacer + right
+                # pad to usable width to clear leftover artifacts within the reserved area
+                try:
+                    pad = max(0, usable_width - _display_width(composed))
+                except Exception:
+                    pad = max(0, usable_width - len(composed))
+                out = composed + (' ' * pad)
+                try:
+                    stdscr.addstr(h-1, 1, out[: max(0, usable_width)])
+                except Exception:
+                    try:
+                        stdscr.addstr(h-1, 1, out[: usable_width])
+                    except Exception:
+                        pass
+                # Transient notice (show near top-right)
+                try:
+                    if getattr(self, '_transient_notice', None):
+                        msg, exp = self._transient_notice
+                        if time.time() < exp:
+                            # right-align near top
+                            try:
+                                stdscr.attron(curses.A_BOLD)
+                                stdscr.addstr(0, max(1, w - len(msg) - 2), msg[:w-4])
+                                stdscr.attroff(curses.A_BOLD)
+                            except Exception:
+                                pass
+                        else:
+                            self._transient_notice = None
+                except Exception:
+                    pass
 
                 # Draw input
                 prompt = f"{self.current_room.name}> "
@@ -838,13 +1077,10 @@ class ChatIRC:
                 except Exception:
                     pass
 
-                # Draw spinner if API call is inflight; place it after status and color by theme
+                # Draw spinner if API call is inflight; place it in the reserved area at far-right and color by theme
                 try:
-                    # compute visible status width
-                    status = f"Room: {self.current_room.name} | Theme: {self.theme}"
-                    visible_status = status[:max(0, w-12)]
-                    disp_status_w = _display_width(visible_status)
-                    spinner_col = 1 + disp_status_w + 1
+                    # spinner sits in the reserved area immediately after the usable status width
+                    spinner_col = min(w-2, 1 + max(0, (w - 2) - spinner_reserve))
                     # choose color pair for spinner
                     if self.theme == 'glow':
                         spinner_pair = 4
@@ -855,14 +1091,15 @@ class ChatIRC:
                         self._spinner_pos += 1
                         try:
                             stdscr.attron(curses.color_pair(spinner_pair) | curses.A_BOLD)
-                            stdscr.addstr(h-1, min(w-2, spinner_col), f" {s}")
+                            # draw spinner within reserved area (leading space + char)
+                            stdscr.addstr(h-1, spinner_col, f" {s}")
                             stdscr.attroff(curses.color_pair(spinner_pair) | curses.A_BOLD)
                         except curses.error:
                             pass
                     else:
-                        # clear spinner area (a couple of chars)
+                        # clear entire reserved spinner area so no stale characters remain
                         try:
-                            stdscr.addstr(h-1, min(w-2, spinner_col), '   ')
+                            stdscr.addstr(h-1, min(w-2, spinner_col), ' ' * spinner_reserve)
                         except curses.error:
                             pass
                 except Exception:
@@ -907,8 +1144,22 @@ class ChatIRC:
                         draw_screen(h, w)
                         stdscr.refresh()
                         # start background API call with a snapshot of messages (include the new user message)
-                        payload = list(self.current_room.messages)
-                        started = self.start_api_call(payload, user_input)
+                        snap = list(self.current_room.messages)
+                        # always ensure there's at least one system seed message
+                        if not any(m.get('role') == 'system' for m in snap):
+                            snap.insert(0, {"role": "system", "content": "You are ChatIRC Navigator, nostalgic and friendly."})
+                        # determine per-room model
+                        room_model = getattr(self.current_room, 'model', None)
+                        # trim messages to token budget, preserving system messages
+                        trimmed_payload, was_trimmed = _trim_messages_to_budget(snap, MAX_TOKEN_BUDGET)
+                        if was_trimmed:
+                            # set a transient UI notice for a few seconds
+                            try:
+                                self._transient_notice = ("⚠️ old history trimmed", time.time() + 3.0)
+                            except Exception:
+                                pass
+                        # start background API call passing the desired model explicitly
+                        started = self.start_api_call(trimmed_payload, user_input, model=room_model)
                         if not started:
                             ts = datetime.now().strftime('%H:%M')
                             self.current_room.chat_log.append(f"[ROLE:sys][{ts}] * Another request is in progress. Please wait...")
@@ -1093,6 +1344,47 @@ class ChatIRC:
                 self.add_to_chat(f"Topic set to: {self.current_room.topic}", 1, "*")
         elif cmd == "/help":
             self.add_to_chat("Commands: /quit /clear /save [file] /load <file> /topic [new] /help /room <name|num> /rooms /nick <name> /theme <name> /saveconfig", 1, "*")
+        elif cmd == "/model":
+            if len(parts) < 2:
+                cur = getattr(self.current_room, 'model', None) or MODEL
+                self.add_to_chat(f"Current model for room {self.current_room.name}: {cur}", 1, "*")
+            else:
+                new_model = parts[1]
+                self.current_room.model = new_model
+                self.add_to_chat(f"Model for room {self.current_room.name} set to: {new_model}", 1, "*")
+        elif cmd == "/seed":
+            # show or set the system seed message for the room
+            if len(parts) < 2:
+                # show current system seeds
+                systems = [m.get('content') for m in self.current_room.messages if m.get('role') == 'system']
+                if systems:
+                    for s in systems:
+                        self.add_to_chat(f"Seed: {s}", 1, "*")
+                else:
+                    self.add_to_chat("No system seed set for this room.", 1, "*")
+            else:
+                seed_text = " ".join(parts[1:])
+                # replace the first system message or insert at front
+                found = False
+                for idx, m in enumerate(self.current_room.messages):
+                    if m.get('role') == 'system':
+                        self.current_room.messages[idx] = {'role': 'system', 'content': seed_text}
+                        found = True
+                        break
+                if not found:
+                    self.current_room.messages.insert(0, {'role': 'system', 'content': seed_text})
+                self.add_to_chat(f"Seed set for room {self.current_room.name}.", 1, "*")
+        elif cmd == "/trimpolicy":
+            if len(parts) < 2:
+                self.add_to_chat(f"Trim policy for room {self.current_room.name}: {self.current_room.trim_policy} (valid: 'oldest' or 'keep_last:N')", 1, "*")
+            else:
+                newp = parts[1]
+                try:
+                    norm = _normalize_trim_policy(newp)
+                    self.current_room.trim_policy = norm
+                    self.add_to_chat(f"Trim policy for room {self.current_room.name} set to: {norm}", 1, "*")
+                except Exception as e:
+                    self.add_to_chat(f"Invalid trim policy '{newp}': {e}", 1, "*")
         elif cmd == "/getkey":
             # open browser to OpenAI API key create page and show a help line
             try:

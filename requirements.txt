@@ -4,3 +4,4 @@ pytest
 
 # For accurate terminal column width handling (Unicode)
 wcwidth
+tiktoken
