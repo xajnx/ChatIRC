@@ -1,0 +1,145 @@
+name: Build and attach release binaries
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  build-and-upload:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            osname: linux
+            arch: x86_64
+          - os: windows-latest
+            osname: windows
+            arch: x86_64
+          - os: macos-latest
+            osname: macos
+            arch: x86_64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          # install optional deps if present
+          if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
+        shell: bash
+
+      - name: Build single-file binary (PyInstaller)
+        run: |
+          # ensure a clean build
+          rm -rf build dist
+          pyinstaller --noconfirm --onefile chatirc.py
+        shell: bash
+
+      - id: package
+        name: Package artifact
+        run: |
+          set -euo pipefail
+          mkdir -p release_artifacts
+          OSNAME="${{ matrix.osname }}"
+          ARCH="${{ matrix.arch }}"
+          # derive tag from GITHUB_REF if present (refs/tags/<tag>) else fallback to run id
+          TAG="${GITHUB_REF##refs/tags/}"
+          if [ -z "$TAG" ] || [ "$TAG" = "$GITHUB_REF" ]; then
+            TAG="${GITHUB_RUN_ID}"
+          fi
+          ART_BASE=chatirc-${TAG}-${OSNAME}-${ARCH}
+          if [ -f dist/chatirc.exe ]; then
+            mv dist/chatirc.exe release_artifacts/${ART_BASE}.exe
+          elif [ -f dist/chatirc ]; then
+            mv dist/chatirc release_artifacts/${ART_BASE}
+          else
+            echo "No build artifact found" && ls -la dist && exit 1
+          fi
+          # compress the artifact
+          tar -czf release_artifacts/${ART_BASE}.tar.gz -C release_artifacts $(basename release_artifacts/${ART_BASE}*)
+          echo "ART_PATH=release_artifacts/${ART_BASE}.tar.gz" >> $GITHUB_OUTPUT
+          echo "ART_NAME=${ART_BASE}.tar.gz" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: "Conditional: Sign Windows binary"
+        if: matrix.osname == 'windows' && secrets.WINDOWS_SIGN_CERT
+        run: |
+          echo "Signing on Windows (signtool)"
+          echo "$WINDOWS_SIGN_CERT" | base64 -d > cert.pfx
+          signtool sign /fd SHA256 /a /f cert.pfx /p "$WINDOWS_SIGN_PASSWORD" dist/chatirc.exe
+        shell: bash
+
+      - name: "Conditional: Sign macOS binary"
+        if: matrix.osname == 'macos' && secrets.MACOS_SIGN_P12
+        run: |
+          echo "Signing on macOS (codesign)"
+          echo "$MACOS_SIGN_P12" | base64 -d > cert.p12
+          security create-keychain -p actions build.keychain || true
+          security import cert.p12 -P "$MACOS_SIGN_PASSWORD" -k build.keychain -T /usr/bin/codesign || true
+          security list-keychains -s build.keychain
+          codesign --options runtime --sign "$MACOS_SIGN_IDENTITY" dist/chatirc || true
+        shell: bash
+
+      - name: Compute SHA256 checksum
+        run: |
+          sha256sum "${{ steps.package.outputs.ART_PATH }}" > "${{ steps.package.outputs.ART_PATH }}.sha256"
+        shell: bash
+
+      - name: Upload release asset
+        if: github.event_name == 'release'
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: ${{ steps.package.outputs.ART_PATH }}
+          asset_name: ${{ steps.package.outputs.ART_NAME }}
+          asset_content_type: application/gzip
+
+      - name: Upload checksum asset
+        if: github.event_name == 'release'
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: ${{ steps.package.outputs.ART_PATH }}.sha256
+          asset_name: ${{ steps.package.outputs.ART_NAME }}.sha256
+          asset_content_type: text/plain
+
+      - name: Upload artifact to Gumroad
+        if: github.event_name == 'release' && secrets.GUMROAD_TOKEN && secrets.GUMROAD_PRODUCT_ID
+        run: |
+          set -euo pipefail
+          ART=${{ steps.package.outputs.ART_PATH }}
+          echo "Uploading $ART to Gumroad product $GUMROAD_PRODUCT_ID"
+          # Gumroad file upload endpoint (v2): POST /products/:product_id/files
+          RESP=$(curl -s -w "%{http_code}" -o /tmp/gumresp.txt -F "access_token=$GUMROAD_TOKEN" -F "file=@${ART}" "https://api.gumroad.com/v2/products/${GUMROAD_PRODUCT_ID}/files")
+          CODE=$?
+          HTTP_CODE=$(tail -n1 /tmp/gumresp.txt || echo '')
+          echo "Gumroad response:"; cat /tmp/gumresp.txt
+          if [ $CODE -ne 0 ]; then
+            echo "Curl failed with exit $CODE"; exit 1
+          fi
+        env:
+          GUMROAD_TOKEN: ${{ secrets.GUMROAD_TOKEN }}
+          GUMROAD_PRODUCT_ID: ${{ secrets.GUMROAD_PRODUCT_ID }}
+        shell: bash
+
+      - name: Persist artifact for workflow_dispatch (upload to workflow run)
+        if: github.event_name != 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.ART_NAME }}
+          path: ${{ steps.package.outputs.ART_PATH }}

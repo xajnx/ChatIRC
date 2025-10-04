@@ -329,6 +329,17 @@ class ChatIRC:
     def _run_api_call_thread(self, payload_messages: List[Dict[str, str]], user_input: str):
         """Worker thread target: run the API call and put (user_input, success, payload) into queue."""
         try:
+            # Optional debug: if env var set, publish a short snapshot of the payload to chat log
+            try:
+                if os.environ.get("CHATIRC_DEBUG_PAYLOADS"):
+                    ts = datetime.now().strftime('%H:%M')
+                    try:
+                        payload_preview = json.dumps(payload_messages, ensure_ascii=False)[:400]
+                    except Exception:
+                        payload_preview = str(payload_messages)[:400]
+                    self.current_room.chat_log.append(f"[ROLE:sys][{ts}] *DEBUG PAYLOAD: {payload_preview}")
+            except Exception:
+                pass
             resp = self.run_api_call(payload_messages)
             reply = self._extract_reply_from_response(resp)
             self._api_queue.put((user_input, True, reply))
@@ -810,6 +821,11 @@ class ChatIRC:
                             # append assistant message and chat (role-marked)
                             ts = datetime.now().strftime('%H:%M')
                             self.current_room.chat_log.append(f"[ROLE:assistant][{ts}] Chat> {reply}")
+                            # also append assistant reply to the room's message history
+                            try:
+                                self.current_room.append_message("assistant", reply)
+                            except Exception:
+                                pass
                         else:
                             err = self.parse_error(str(payload))
                             ts = datetime.now().strftime('%H:%M')
@@ -883,10 +899,16 @@ class ChatIRC:
                         # Post the user message immediately to chat (role-marked) and start an async API call
                         ts = datetime.now().strftime('%H:%M')
                         self.current_room.chat_log.append(f"[ROLE:user][{ts}] {self.nick}> {user_input}")
+                        # Also append to the room's message history so the assistant sees it
+                        try:
+                            self.current_room.append_message("user", user_input)
+                        except Exception:
+                            pass
                         draw_screen(h, w)
                         stdscr.refresh()
-                        # start background API call
-                        started = self.start_api_call(self.current_room.messages, user_input)
+                        # start background API call with a snapshot of messages (include the new user message)
+                        payload = list(self.current_room.messages)
+                        started = self.start_api_call(payload, user_input)
                         if not started:
                             ts = datetime.now().strftime('%H:%M')
                             self.current_room.chat_log.append(f"[ROLE:sys][{ts}] * Another request is in progress. Please wait...")
