@@ -1,0 +1,58 @@
+name: Build Debug (manual)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ release-prep ]
+
+jobs:
+  build-debug:
+    name: Build debug on ubuntu
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+
+      - name: Install build deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
+        shell: bash
+
+      - name: Run PyInstaller build
+        run: |
+          set -euxo pipefail
+          rm -rf build dist || true
+          pyinstaller --noconfirm --onefile --add-data "assets/appicon.png:assets" --add-data "assets/appicon.ico:assets" --add-data "assets/appicon.icns:assets" --add-data "assets/theme-classic.png:assets" --add-data "assets/theme-neon.png:assets" --add-data "assets/theme-glow.png:assets" --add-data "assets/theme-mono.png:assets" chatirc.py
+        shell: bash
+
+      - name: Package artifact
+        run: |
+          set -euo pipefail
+          mkdir -p release_artifacts
+          ART_BASE=chatirc-debug-${{ github.run_id }}-linux-x86_64
+          if [ -f dist/chatirc ]; then
+            mv dist/chatirc release_artifacts/${ART_BASE}
+          elif [ -f dist/chatirc.exe ]; then
+            mv dist/chatirc.exe release_artifacts/${ART_BASE}.exe
+          else
+            echo "No build artifact found" && ls -la dist && exit 1
+          fi
+          tar -czf release_artifacts/${ART_BASE}.tar.gz -C release_artifacts $(basename release_artifacts/${ART_BASE}*)
+          sha256sum release_artifacts/${ART_BASE}.tar.gz > release_artifacts/${ART_BASE}.tar.gz.sha256
+        shell: bash
+
+      - name: Upload build artifacts & logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-debug-artifacts
+          path: |
+            release_artifacts/**
+            dist/**
+            build/**
+            build/chatirc/warn-chatirc.txt
