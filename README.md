@@ -96,24 +96,3 @@ python3 -m pip install -r requirements.txt
 pytest -q
 ```
 
-## Gumroad deployment and credentials
-
-
-For security, do NOT store Gumroad credentials in plaintext in the repo. Instead store them as GitHub repository secrets and reference them in your workflow. Required secrets for the current workflow:
-
-  - `GUMROAD_TOKEN` — your Gumroad access token
-  - `GUMROAD_PRODUCT_ID` — the product id to upload files to
-
-When developing locally you can export these values in your shell session (not committed) or use a credential helper. Example:
-
-```bash
-export GUMROAD_TOKEN="<token>"
-export GUMROAD_PRODUCT_ID="<product-id>"
-python3 scripts/gumroad_upload.py --file dist/chatirc-<tag>-linux-x86_64.tar.gz
-```
-
-The repository also contains `scripts/gumroad_upload.py` which performs a file upload and prints a helpful response; the workflow will call the same endpoint when the secrets are configured.
-
-Optional: Slack notifications
-
- - You can set a `SLACK_WEBHOOK` GitHub secret to notify a Slack channel when a release is published. The workflow will post a short message containing the release URL. Keep the webhook secret in GitHub secrets and do not commit it to the repo.
