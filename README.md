@@ -62,10 +62,6 @@ python3 chatirc.py
 
 - A `Makefile` target `make build` runs the script. The resulting binary will appear under `dist/`.
 
-## Distribution & monetization notes
-
-- Add a GitHub repository and create releases for the binaries. You can sell/provide releases behind a payment system (Gumroad, Ko-fi) or use a donate model. Ensure your README explains storage of `openapi_key` and does not include private keys.
-
 ## Security & privacy
 
 - Do NOT commit your `openapi_key` file into version control. It's ignored via `.gitignore`.
@@ -94,5 +90,4 @@ MIT
 ```bash
 python3 -m pip install -r requirements.txt
 pytest -q
-```
-
+``` 
